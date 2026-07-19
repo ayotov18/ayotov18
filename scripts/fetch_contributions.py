@@ -24,6 +24,61 @@ USERNAME = os.environ.get("GH_USER", "ayotov18")
 URL = "https://github.com/users/{}/contributions"
 OUT = "data/contributions.json"
 
+# A token (PROFILE_TOKEN / GH_TOKEN / GITHUB_TOKEN) unlocks the authenticated
+# GraphQL calendar, which INCLUDES private contributions — so private repos
+# (e.g. the real product work) show up. Without a token we fall back to the
+# public HTML scrape (public contributions only).
+TOKEN = (os.environ.get("PROFILE_TOKEN")
+         or os.environ.get("GH_TOKEN")
+         or os.environ.get("GITHUB_TOKEN"))
+
+# GraphQL contributionLevel enum -> the 0..4 heatmap level.
+_LEVEL = {
+    "NONE": 0,
+    "FIRST_QUARTILE": 1,
+    "SECOND_QUARTILE": 2,
+    "THIRD_QUARTILE": 3,
+    "FOURTH_QUARTILE": 4,
+}
+
+
+def fetch_graphql(token: str) -> list[dict]:
+    """The authenticated user's full calendar, private contributions included."""
+    query = """
+    query {
+      viewer {
+        contributionsCollection {
+          contributionCalendar {
+            weeks { contributionDays { date contributionCount contributionLevel } }
+          }
+        }
+      }
+    }
+    """
+    r = requests.post(
+        "https://api.github.com/graphql",
+        headers={"Authorization": f"bearer {token}",
+                 "User-Agent": "profile-art"},
+        json={"query": query},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if "errors" in body:
+        raise RuntimeError(f"graphql: {body['errors']}")
+    weeks = (body["data"]["viewer"]["contributionsCollection"]
+             ["contributionCalendar"]["weeks"])
+    days = []
+    for w in weeks:
+        for d in w["contributionDays"]:
+            days.append({
+                "date": d["date"],
+                "count": d["contributionCount"],
+                "level": _LEVEL.get(d["contributionLevel"], 0),
+            })
+    days.sort(key=lambda d: d["date"])
+    return days
+
 
 def fetch_html(user: str) -> str:
     r = requests.get(
@@ -108,12 +163,18 @@ def stats(days: list[dict]) -> dict:
 
 def main() -> int:
     user = sys.argv[1] if len(sys.argv) > 1 else USERNAME
-    days = parse(fetch_html(user))
+    if TOKEN:
+        days = fetch_graphql(TOKEN)
+        source = "graphql (private included)"
+    else:
+        days = parse(fetch_html(user))
+        source = "public html scrape"
     if not days:
-        print("no day cells parsed — GitHub markup may have changed", file=sys.stderr)
+        print("no contribution days parsed", file=sys.stderr)
         return 1
     payload = {
         "user": user,
+        "source": source,
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "days": days,
         "stats": stats(days),
